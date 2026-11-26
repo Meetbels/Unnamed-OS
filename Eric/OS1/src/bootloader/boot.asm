@@ -1,4 +1,4 @@
-org 0x7C00 
+org 0x7C00
 bits 16
 
 %define ENDL 0x0D, 0X0A
@@ -13,7 +13,7 @@ nop
 bdb_oem: db 'MSWIN4.1'
 bdb_bytes_per_sector: dw 512
 bdb_sectors_per_cluster: db 1
-bdb_reserved_sector: dw 1
+bdb_reserved_sectors: dw 1
 bdb_fat_count: db 2
 bdb_dir_entires_count: dw 0E0h
 bdb_total_sectors: dw 2880
@@ -33,7 +33,167 @@ ebr_volume_label: db 'NANOBYTE OS' ; 11 bytes, padded with spaces
 ebr_system_id: db 'FAT12   ' ; 8 bytes
 
 start:
-    jmp main
+    ;setup data segments
+    mov ax, 0
+    mov ds, ax
+    mov es, ax
+
+    ;setup stack
+    mov ss, ax
+    mov sp, 0x7C00
+
+    ; some BIOSes might start at 07C0:0000 instead of 0000:7C00 so we make 
+    ; sure we are in the expected location first
+    push es
+    push word .after
+    retf
+
+.after:
+
+    ;read something from floppy disk
+    ;BIOS should set DL to drive number
+    mov [ebr_drive_number], dl
+
+    mov si, msg_loading
+    call puts
+
+    ; read drive parameters 
+    push es
+    mov ah, 08h
+    int 13h
+    jc floppy_error
+    pop es
+
+    and cl, 0x3F                ;remove top 2 bits
+    xor ch, ch
+    mov [bdb_sectors_per_track], cx ;sector count
+
+    inc dh
+    mov [bdb_heads], dh
+
+    ; read FAT root directory
+    ; compute LBA of root directory = reserved + fats * sectors_per_fat
+    mov ax, [bdb_sectors_per_fat]  
+    mov bl, [bdb_fat_count]
+    xor bh, bh
+    mul bx
+    add ax, [bdb_reserved_sectors]
+    push ax
+
+    ; compute size of root directory = (32 * number_of_entries) / bytes_per_sector
+    mov ax, [bdb_sectors_per_fat]
+    shl ax, 5
+    xor dx, dx
+    div word [bdb_bytes_per_sector]
+
+    test dx, dx
+    jz .root_dir_after
+    inc ax
+
+
+.root_dir_after:
+
+    mov cl, al
+    pop ax
+    mov dl, [ebr_drive_number]
+
+    mov bx, buffer                 
+    call disk_read
+
+    ; search for kernel.bin
+    xor bx, bx
+    mov di, buffer
+
+.search_kernel:
+    mov si, file_kernel_bin
+    mov cx, 11
+    push di
+    repe cmpsb
+    pop di
+    je .found_kernel
+
+    add di, 32
+    inc bx
+    cmp bx, [bdb_dir_entires_count]
+    jl .search_kernel
+
+    jmp kernel_not_found_error
+
+.found_kernel:
+
+    mov ax, [di + 26] ; get address of first cluster field
+    mov [kernel_cluster], ax
+
+    ;load FAT from disk into memory
+    mov ax, [bdb_reserved_sectors]
+    mov bx, buffer
+    mov cl, [bdb_sectors_per_fat]
+    mov dl, [ebr_drive_number]
+    call disk_read
+
+    ;read kernel and process FAT chain
+    mov bx, KERNEL_LOAD_SEGMENT
+    mov es, bx
+    mov bx, KERNEL_LOAD_OFFSET
+
+.load_kernel_loop:
+
+    mov ax, [kernel_cluster]
+
+    ;bad hardcoded value
+    add ax, 31
+
+    mov cl, 1
+    mov dl, [ebr_drive_number]
+    call disk_read
+
+    add bx, [bdb_bytes_per_sector]
+
+
+    ;compute location of next cluster
+    mov ax, [kernel_cluster]
+    mov cx, 3
+    mul cx
+    mov cx, 2
+    div cx      ; ax = index of entry in FAT, dx = cluster mod 2
+
+    mov si, buffer
+    add si, ax
+    mov ax, [ds:si]     ; read FAT
+
+    or dx, dx
+    jz .even
+
+.odd:
+    shr ax, 4
+    jmp .next_cluster_after
+
+.even:
+    and ax, 0x0FFF
+
+.next_cluster_after:
+    cmp ax, 0x0FF8
+    jae .read_finish
+
+    mov [kernel_cluster],ax
+    jmp .load_kernel_loop
+
+.read_finish:
+
+    mov dl, [ebr_drive_number]
+
+    mov ax, KERNEL_LOAD_SEGMENT
+    mov ds, ax
+    mov es, ax
+
+    jmp KERNEL_LOAD_SEGMENT:KERNEL_LOAD_OFFSET
+
+    jmp wait_key_and_reboot ; should never happen
+
+    cli ;disable interrupts
+    hlt
+
+
 
 ;
 ; Prints a string to the screen.
@@ -58,6 +218,10 @@ puts:
     pop si
     ret
 
+
+;
+; Error handlers
+;
 floppy_error:
     mov si, msg_read_failed
     call puts
@@ -67,10 +231,14 @@ wait_key_and_reboot:
     mov ah, 0
     int 16h                     ;wait for keypress
     jmp 0FFFFh:0                ;jump to to beginning of BIOS, should reboot
-
 .halt:
     cli                         ;disable interrupts so we cant get cpu out of halt state
     hlt
+
+kernel_not_found_error:
+    mov si, msg_kernel_not_found
+    call puts
+    jmp wait_key_and_reboot
 
 ;
 ; Converts LBA address to CHS address
@@ -172,38 +340,16 @@ disk_reset:
     popa
     ret
 
-
-main:
-    ;setup data segments
-    mov ax, 0
-    mov ds, ax
-    mov es, ax
-
-    ;setup stack
-    mov ss, ax
-    mov sp, 0x7C00
-
-    ;read something from floppy disk
-    ;BIOS should set DL to drive number
-    mov [ebr_drive_number], dl
-
-    mov ax, 1           ;LBA=1, second sector from disk
-    mov cl, 1           ;1 sector to read
-    mov bx, 0x7E00      ;data should be after the bootloader
-    call disk_read
-
-    mov si, msg_hello
-    call puts
-
-    cli ;disable interrupts
-    hlt
-
-.halt:
-    jmp .halt
-
-
 msg_read_failed: db 'Read from disk failed!', ENDL, 0
-msg_hello: db 'Hello World!', ENDL, 0
+msg_loading: db 'Loading', ENDL, 0
+msg_kernel_not_found: db 'KERNEL.BIN file not found!', ENDL, 0
+file_kernel_bin: db 'KERNEL  BIN'
+kernel_cluster: dw 0
+
+KERNEL_LOAD_SEGMENT equ 0x2000
+KERNEL_LOAD_OFFSET  equ 0
+
+buffer:
 
 times 510-($-$$) db 0
 dw 0AA55h
